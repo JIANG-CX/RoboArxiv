@@ -11,12 +11,20 @@ on:
     # Recommended tool: https://crontab.guru/
     - cron: "0 0 * * *"
 
+permissions:
+  contents: write
+
+concurrency:
+  group: update-feed
+  cancel-in-progress: false
+
 jobs:
   build:
     runs-on: ubuntu-latest
+    timeout-minutes: 20
 
     steps:
-      - uses: actions/checkout@v2
+      - uses: actions/checkout@v6
       - name: Download ArxivFeed
         env:
           GITHUB_PAT: ${{ github.token }}
@@ -26,13 +34,15 @@ jobs:
           RENAME: "arxivfeed.tgz"
         shell: bash
         run: |
-          curl -sL --fail \
+          set -euo pipefail
+          curl -sL --fail --retry 5 --retry-all-errors --retry-delay 5 \
             -H "Accept: application/vnd.github.v3+json" \
             -H "Authorization: Bearer ${GITHUB_PAT}" \
               "https://api.github.com/repos/${REPO}/releases/${VERSION}" \
               | jq -r ".assets | .[] | select(.name | test(\"${MATCH}\")) | .url" \
               | tee asset.url
-          curl -sL --fail \
+          test -s asset.url
+          curl -sL --fail --retry 5 --retry-all-errors --retry-delay 5 \
             -H "Accept: application/octet-stream" \
             -H "Authorization: Bearer ${GITHUB_PAT}" \
               -o "${RENAME}" \
@@ -40,9 +50,27 @@ jobs:
           tar -zxvf arxivfeed.tgz --strip-components 1 $(tar tf arxivfeed.tgz | grep /arxivfeed)
           chmod +x arxivfeed
       - name: Build rss
-        run: ./arxivfeed
+        shell: bash
+        run: |
+          set -uo pipefail
+          for attempt in 1 2 3 4 5; do
+            echo "ArxivFeed attempt ${attempt}/5"
+            rm -rf target
+            if ./arxivfeed; then
+              exit 0
+            fi
+
+            if [[ "${attempt}" -eq 5 ]]; then
+              echo "::error::ArxivFeed failed after 5 attempts."
+              exit 1
+            fi
+
+            delay=$((30 * 2 ** (attempt - 1)))
+            echo "::warning::ArxivFeed failed; retrying in ${delay}s."
+            sleep "${delay}"
+          done
       - name: Deploy to GitHub Pages
-        uses: peaceiris/actions-gh-pages@v3
+        uses: peaceiris/actions-gh-pages@v4.1.0
         with:
           github_token: ${{ secrets.GITHUB_TOKEN }}
           publish_dir: ./target
